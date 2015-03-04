@@ -1,0 +1,346 @@
+#!/usr/bin/env python
+
+from pysphere import VIServer
+from pysphere import resources
+from pysphere import VITask
+from getpass import getpass, getuser
+import argparse
+from datetime import datetime
+from ConfigParser import ConfigParser
+from Queue import Queue
+import time
+import sys
+import os
+import signal
+
+# TODO: - allow flags to pass in description for snapshot
+#       - work out a way to run multiple commands at once (repl)
+# - Allow a quiet option:
+#   - extract out print statements to helper method that checks 
+#     for a quiet flag first
+# - Add support for groupings of hosts in config file (look into ParseConfig)
+# - Make actions asynchronous so it goes faster (use some kind of Queue; before exiting drain queue)
+#   - Guest OS actions do NOT support asynchronous tasks
+# - Delete multiple snapshots for a host in one command
+# - Extract out subcommand arg parsing into a helper
+
+
+class VMTool(object):
+
+    usage="""vmtool <subcommand> <args>
+Subcommands:
+\tpoweron HOST1 HOST2 ...
+\tpoweroff HOST1 HOST2 ...
+\tsnapshot [--poweroff] HOST1 HOST2 ...
+\tstatus HOST1 HOST2 ...
+\tpopsnapshot HOST1 HOST2 ...
+\tlistsnapshots HOST1 HOST2 ...
+
+Try `vmtool <subcommand>` for subcommand-specific parameters
+"""
+
+    def __init__(self):
+        # Parse the subcommand
+        parser = argparse.ArgumentParser(description="Autosnapshot tool for SysAdmins",
+                                         usage=VMTool.usage)
+        # In this level of arg parsing, just get the subcommand
+        parser.add_argument('command', help="Subcommand to execute")
+        args = parser.parse_args(sys.argv[1:2])
+        # Valid top level commands go here
+        valid_commands = ["poweron", "poweroff", "snapshot", "status", "popsnapshot", "listsnapshots"]
+        # Attempt to load a config file
+        self.__load_config()
+        # Create a task queue for asynchronous task management
+        self.task_queue = Queue()
+        # Make sure that the parsed command corresponds to a method in this class
+        if not args.command in valid_commands:
+            print("Unknown subcommand: " + args.command)
+            parser.print_help()
+            exit(1)
+        # Authenticate to the vSphere server
+        self.__auth()
+        # It's a valid method, so run it!
+        self.exit_status = 0
+        getattr(self, args.command)()
+        exit(self.exit_status)
+
+
+    ####################
+    ## SUBCOMMAND LOGIC
+    ####################
+
+    # Powers on the hosts
+    def poweron(self):
+        args = self.__parse_args("Power on given hosts", "The hosts to power on")
+        #vms = list(map(lambda name: self.__gethost(name), args.hosts))
+        vms = self.__get_vms(args.hosts, args.g)
+        for vm in vms:
+            self.__poweron(vm)
+        self.__flush_task_queue("Waiting for all hosts to power on...")
+
+    # Powers down the hosts
+    def poweroff(self):
+        args = self.__parse_args("Power off given hosts", "The hosts to power off")
+        #vms = list(map(lambda name: self.__gethost(name), args.hosts))
+        vms = self.__get_vms(args.hosts, args.g)
+        for vm in vms:
+            self.__poweroff(vm)
+        self.__flush_task_queue("Waiting for all hosts to power off...")
+
+    # Takes a list of hosts and snapshots them all
+    def snapshot(self):
+        # Parse some subcommand arguments
+        args = self.__parse_args("Snapshot the given hosts", "The hosts to snapshot", extra='snapshot')
+        # Give a single description for all the snapshots
+        desc = raw_input("Please give a short description: ")
+        # Map host names onto VM objects
+        vms = self.__get_vms(args.hosts, args.g)
+        # If we need to power off VMs, do this first
+        if args.poweroff:
+            for vm in vms:
+                self.__poweroff(vm)
+        self.__flush_task_queue("Waiting for all hosts to completely power off before snapshotting...")
+        # Snapshot the VMs
+        for vm in vms:
+            self.__snapshot(vm, desc)
+        self.__flush_task_queue("Waiting for all snapshots to complete...")
+        # If we powered off the VMs, bring them back up
+        if args.poweroff:
+            for vm in vms:
+                self.__poweron(vm)
+        self.__flush_task_queue("Waiting for all hosts to power on...")
+
+    # Retrieves the status of the hosts
+    # TODO: Make this cleaner; isolate logic from actions/details
+    def status(self):
+        # Parse some subcommand arguments
+        args = self.__parse_args("Fetch the status of the given hosts", "Hosts to query")
+        vms = self.__get_vms(args.hosts, args.g)
+        for vm in vms:
+            print("%s status: %s" % (vm.get_property('name'), self.__status(vm)))
+
+    # Deletes the most recent snapshot. Great for cleaning up after patching
+    def popsnapshot(self):
+        # Parse some subcommand arguments
+        args = self.__parse_args("Remove the most recent snapshot from the given hosts", "The hosts to remove a snapshot from")
+        # Map host names onto VM objects
+        #vms = list(map(lambda name: self.__gethost(name), args.hosts))
+        vms = self.__get_vms(args.hosts, args.g)
+        for vm in vms:
+            snapshot = self.__getnewestsnapshot(vm)    
+            if snapshot != None:
+                self.__deletesnapshot(vm, snapshot)
+        self.__flush_task_queue("Waiting for snapshots to be deleted...")
+
+    # TODO: Make this cleaner; isolate logic from actions/details
+    def listsnapshots(self):
+        # Parse some subcommand arguments
+        args = self.__parse_args("List all snapshots on the given hosts", "The hosts to list snapshots for")
+        vms = self.__get_vms(args.hosts, args.g)
+        for vm in vms:
+            snapshots = vm.get_snapshots()
+            if snapshots == []:
+                print("No snapshots for %s" % vm.get_property('name'))
+                continue
+            header = "%s snapshots:" % vm.get_property('name')
+            print(header)
+            print("="*len(header))
+            for snapshot in snapshots:
+                self.__print_snapshot_info(snapshot)
+            # Newline for readability
+            print('')
+
+
+    ########################
+    ## BEGIN HELPER METHODS
+    ########################
+
+    # Returns the most recent snapshot, or None if no snapshots exist for the given host
+    def __getnewestsnapshot(self, host):
+        snapshots = host.get_snapshots()
+        if len(snapshots) == 0:
+            print("No snapshots found for host %s... Skipping." % host.get_property('name'))
+            return None
+        snapshot = snapshots[-1]
+        return snapshot
+
+    def __print_snapshot_info(self, snapshot):
+        print("Name: %s" % snapshot.get_name())
+        print("\tDescription: %s" % snapshot.get_description())
+        print("\tState: %s" % snapshot.get_state())
+        print("\tCreated: " + time.strftime("%m-%d-%Y %H:%M:%S", snapshot.get_create_time()))
+
+    # Given a string for a requested host, returns the VM object or None if not found
+    def __gethost(self, host):
+        vm = None
+        try:
+            suffixes = self.config.get("vsphere", "suffixes")
+        except:
+            suffixes = []
+        suffixes.append("")
+        for suffix in suffixes:
+            try:
+                # See if the full VM name is given (possibly trying to use suffixes in the config file
+                vm = self.server.get_vm_by_name(host + suffix)
+                break
+            except:
+                pass
+        if vm == None:
+            print("WARNING: Unknown host %s. Tried %s. Skipping." % (host, ", ".join([host+suffix for suffix in suffixes])))
+        return vm
+
+    def __get_vms(self, names, use_groups):
+        if use_groups:
+            return self.__hostgroups_to_vms(names)
+        else:
+            return self.__hostnames_to_vms(names)
+
+    def __hostnames_to_vms(self, hostnames):
+        vms = list(map(lambda name: self.__gethost(name), hostnames))
+        return list(filter(lambda vm: vm!=None, vms))
+
+    def __hostgroups_to_vms(self, hostgroups):
+        hosts = []
+        for hostgroup in hostgroups:
+            try:
+                hosts += self.config.get('hostgroups', hostgroup).replace(" ", "").split(',')
+            except:
+                print("WARNING: Unknown hostgroup %s. Check your config file and make sure it looks sane. Skipping." % hostgroup)
+        return self.__hostnames_to_vms(hosts)
+
+
+    def __status(self, host):
+        return host.get_status()
+
+    def __parse_args(self, command_desc, host_desc, extra=None):
+        parser = argparse.ArgumentParser(description=command_desc)
+        parser.add_argument("hosts", help=host_desc, nargs='+')
+        parser.add_argument("-g", action="store_true", default=False, help="Look up hostgroups in a config file instead of using direct hostnames")
+        # Some special argument additions for certain commands
+        if extra == 'snapshot':
+            parser.add_argument("--poweroff", action="store_true", default=False, help="Powers down the listed VMs, snapshots, and powers them back on")
+        return parser.parse_args(sys.argv[2:])
+
+
+
+    ##########################
+    ## CONFIG AND AUTH HELPERS
+    ##########################
+
+    # Setup a connection to VSphere
+    def __auth(self):
+        self.server = VIServer()
+        # TODO: Try to look for a username in a dotfile: ~/.vmtoolrc
+        self.username = self.__get_user()
+        self.vsphere_host = self.__get_vsphere_host()
+        if not self.username:
+            self.username = raw_input("VSphere username: ")
+        if not self.vsphere_host:
+            self.vsphere_host = raw_input("VSphere hostname: ")
+        self.password = getpass("VSphere password: ")
+        try:
+            self.server.connect(VMTool.vsphere_host, self.username, self.password)
+        except resources.vi_exception.VIApiException:
+            print("There was a problem connecting to VSphere as user %s. Perhaps your username or password are incorrect." % self.username)
+            exit(1)
+
+    # Attempt to load a username from a config file
+    def __load_config(self):
+        conf_file = os.path.join(os.environ['HOME'], '.vmtool.conf')
+        self.config = ConfigParser()
+        if os.path.isfile(conf_file):
+            self.config.read(conf_file)
+
+    def __get_user(self):
+        try:
+            return self.config.get('vsphere', 'user')
+        except:
+            return None
+   
+    def __get_vsphere_host(self):
+        try:
+            return self.config.get('vsphere', 'host')
+        except:
+            return None
+
+
+
+    ##########################
+    ## TASK GENERATING HELPERS
+    ##########################
+    def __poweroff(self, vm):
+        if not vm.is_powered_on():
+            print("%s appears to not be in the powered on state. Skipping." % vm.get_property('name'))
+        else:
+            print("Powering down %s..." % vm.get_property('name'))
+            vm.shutdown_guest()
+            task = VIGuestShutdownTask(vm, self.server)
+            self.task_queue.put(task)
+
+    def __poweron(self, vm):
+        if not vm.is_powered_off():
+            print("%s appears to not be in the powered off state. Skipping." % vm.get_property('name'))
+        else:
+            print("Powering on %s" % vm.get_property('name'))
+            self.task_queue.put(vm.power_on(sync_run=False))
+
+    def __snapshot(self, host, desc=""):
+        # Take a snapshot
+        print("Taking snapshot of %s" % host.get_property('name'))
+        task = host.create_snapshot(datetime.today().strftime("%b %d %Y - ") + getuser(), description=desc, sync_run=False)
+        self.task_queue.put(task)
+
+    def __deletesnapshot(self, host, snapshot):
+        header = "\n%s snapshot to be deleted:" % host.get_property('name')
+        print(header)
+        print("="*len(header))
+        self.__print_snapshot_info(snapshot)
+        print("Does this seem right?")
+        yes = ['yes', 'y']
+        no = ['no', 'n']
+        while True:
+            i = raw_input("[y/n] : ")
+            if i in yes:
+                task = host.delete_named_snapshot(snapshot.get_name(), sync_run=False)
+                self.task_queue.put(task)
+                break
+            elif i in no:
+                print("Skipping.")
+                break
+
+
+    # Waits until all tasks in the task queue are finished before returning
+    # (synchronizes on all tasks)
+    def __flush_task_queue(self, message=None):
+        if message and self.task_queue.qsize() != 0:
+            print(message)
+        while self.task_queue.qsize() != 0:
+            task = self.task_queue.get()
+            status = task.wait_for_state(['success', 'error'])
+            if status == 'error':
+                print("ERROR: %s", task.get_error_message())
+
+
+def signal_handler(signal, frame):
+    print("Signal caught, shutting down!")
+    exit(127)
+
+# CUSTOM TASK CLASS FOR GUEST OS SHUTDOWNS
+# This just extends the VITask class in pysphere.
+# It implements a custom get_state() method by checking a VMs power status
+class VIGuestShutdownTask(VITask):
+    def __init__(self, vm, server):
+        self.vm = vm
+        VITask.__init__(self, None, server)
+
+    def get_state(self):
+        vm_state = self.vm.get_status()
+        if vm_state == "POWERED OFF":
+            return 'success'
+        else:
+            return 'running'
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, signal_handler)
+    VMTool()
+
