@@ -13,20 +13,7 @@ import sys
 import os
 import signal
 
-# TODO: - allow flags to pass in description for snapshot
-#       - work out a way to run multiple commands at once (repl)
-# - Allow a quiet option:
-#   - extract out print statements to helper method that checks 
-#     for a quiet flag first
-# - Add support for groupings of hosts in config file (look into ParseConfig)
-# - Make actions asynchronous so it goes faster (use some kind of Queue; before exiting drain queue)
-#   - Guest OS actions do NOT support asynchronous tasks
-# - Delete multiple snapshots for a host in one command
-# - Extract out subcommand arg parsing into a helper
-
-
 class VMTool(object):
-
     usage="""vmtool <subcommand> <args>
 Subcommands:
 \tpoweron HOST1 HOST2 ...
